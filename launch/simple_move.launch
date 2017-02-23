@@ -1,0 +1,19 @@
+<!-- -->
+<launch>
+
+  <node pkg="simple_move" type="world_tf_broadcaster" name="world_tf_broadcaster" output="screen">  </node>
+  <node pkg="simple_move" type="simple_move_node" name="simple_move_node" output="screen">  </node>
+  <node name="angle_pid" pkg="pid" type="controller" >
+    <param name="Kp" value="0.04" />
+    <param name="Ki" value="0.0" />
+    <param name="Kd" value="0.005" />
+    <param name="upper_limit" value="1" />
+    <param name="lower_limit" value="-1" />
+    <param name="windup_limit" value="1" />
+    <param name="diagnostic_period" value="0.02" />
+    <param name="max_loop_frequency" value="100.0" />
+    <param name="min_loop_frequency" value="100.0" />
+    <param name="angle_error" value="false" />
+  </node>
+
+</launch>
