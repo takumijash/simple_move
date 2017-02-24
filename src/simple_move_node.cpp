@@ -1,7 +1,7 @@
 /**
 * A simple example of obstcale avoidance, bug algorithm .. by Jash, 20160215
 */
-
+#include <simple_move_node.h>
 #include <ros/ros.h>
 #include <stdlib.h>
 #include <std_msgs/Int8.h>
@@ -63,6 +63,8 @@ public:
   {
     // Intial
     move_cmd_ = MOVE_STOP;
+    twist_ctrl_cmd.linear.x = twist_ctrl_cmd.linear.y = twist_ctrl_cmd.linear.z = 0;
+    twist_ctrl_cmd.angular.x = twist_ctrl_cmd.angular.y = twist_ctrl_cmd.angular.z = 0;
 
     //Topic you want to publish
     pub_cmd_telepo_ = n_.advertise<geometry_msgs::Twist>("cmd_vel_mux/input/teleop", 10);
@@ -70,8 +72,10 @@ public:
 
     //Topic you want to subscribe
     sub_cmd_avoidance = n_.subscribe<std_msgs::Int8>("/obs_avoidance_topic", 10, &Robot_Drive::Avoidance_cmd_listener, this);
-    sub_control_effort = n_.subscribe<std_msgs::Float64>("/control_effort", 10, &Robot_Drive::pid_control_effort, this);
-
+    sub_angle_control = n_.subscribe<std_msgs::Float64>("/angle_control_effort", 10, &Robot_Drive::angle_control_effort, this);
+    sub_dist_control = n_.subscribe<std_msgs::Float64>("/dist_control_effort", 10, &Robot_Drive::dist_control_effort, this);
+    sub_angle_state = n_.subscribe<std_msgs::Float64>("/angle_state", 10, &Robot_Drive::update_angle_state, this);
+    sub_dist_state = n_.subscribe<std_msgs::Float64>("/dist_state", 10, &Robot_Drive::update_dist_state, this);
     //boost::thread thread_listener(KeyboardListener,10); // compile error, dont know why
   }
 
@@ -139,26 +143,19 @@ public:
     this->drive(DRIVE_CMD_NAVI);
   }
 
-  void pid_control_effort(const std_msgs::Float64::ConstPtr& ctrl_effort)
-  {
-    std_msgs::Float64 cmd;
-    geometry_msgs::Twist base_cmd;
-
-    cmd.data = ctrl_effort->data * -1.0;
-    ROS_INFO("ctrl_effort = %f", cmd.data);
-
-    base_cmd.angular.z = cmd.data;
-    base_cmd.linear.x = 0.0;
-    pub_cmd_navi_.publish(base_cmd);
-  }
-
 private:
   ros::NodeHandle n_;
   ros::Publisher pub_cmd_telepo_;
   ros::Publisher pub_cmd_navi_;
   ros::Subscriber sub_cmd_avoidance;
-  ros::Subscriber sub_control_effort;
+  ros::Subscriber sub_angle_control;
+  ros::Subscriber sub_dist_control;
+  ros::Subscriber sub_angle_state;
+  ros::Subscriber sub_dist_state;
   int8_t move_cmd_;
+  geometry_msgs::Twist twist_ctrl_cmd;
+  std_msgs::Float64 angle_err;
+  std_msgs::Float64 dist_err;
 
   void Set_Move_Cmd(int8_t cmd)
   {
@@ -207,6 +204,46 @@ private:
     return true;
   }
 
+  void angle_control_effort(const std_msgs::Float64::ConstPtr& ctrl_effort)
+  {
+    std_msgs::Float64 cmd;
+    //geometry_msgs::Twist base_cmd;
+
+    if(fabs(dist_err.data) < 0.1) return;
+
+    cmd.data = ctrl_effort->data * -1.0;
+    ROS_INFO("angular ctrl_effort = %f, err = %f", cmd.data, angle_err.data);
+
+    twist_ctrl_cmd.angular.z = cmd.data;
+
+    pub_cmd_navi_.publish(twist_ctrl_cmd);
+  }
+
+  void dist_control_effort(const std_msgs::Float64::ConstPtr& ctrl_effort)
+  {
+    std_msgs::Float64 cmd;
+    //geometry_msgs::Twist base_cmd;
+
+    if(fabs(dist_err.data) < 0.1) return;
+    if(fabs(angle_err.data) > 10.0){twist_ctrl_cmd.linear.x = 0.0; return;}
+
+    cmd.data = ctrl_effort->data * -1.0;
+    ROS_INFO("dist ctrl_effort = %f, err = %f", cmd.data, dist_err.data);
+
+    twist_ctrl_cmd.linear.x = cmd.data;
+
+    pub_cmd_navi_.publish(twist_ctrl_cmd);
+  }
+
+  void update_angle_state(const std_msgs::Float64::ConstPtr& _angle_state)
+  {
+    angle_err.data = _angle_state->data;
+  }
+
+  void update_dist_state(const std_msgs::Float64::ConstPtr& _dist_state)
+  {
+    dist_err.data = _dist_state->data;
+  }
 };//End of class Robot_Keyboard_Drive
 
 
@@ -306,21 +343,30 @@ private:
 };//End of class Obstacle_Detector
 
 
-class Face2Goal
+class Move2Goal
 {
 public:
-  Face2Goal()
+  Move2Goal()
   {
+    // Initial
+    enable_move2goal = false;
+
     //Topic you want to publish
-    pub_setpoint = n_.advertise<std_msgs::Float64>("/setpoint", 10);
-    pub_state = n_.advertise<std_msgs::Float64>("/state", 10);
-    pub_face2goal = n_.advertise<std_msgs::Int8>("/obs_avoidance_topic", 10);
+    pub_angle_setpoint = n_.advertise<std_msgs::Float64>("/angle_setpoint", 10);
+    pub_angle_state = n_.advertise<std_msgs::Float64>("/angle_state", 10);
+    pub_dist_setpoint = n_.advertise<std_msgs::Float64>("/dist_setpoint", 10);
+    pub_dist_state = n_.advertise<std_msgs::Float64>("/dist_state", 10);
+  }
+
+  void move_2_goal_enable(bool en)
+  {
+    enable_move2goal = !!en;
   }
 
   void goal_listener(int n)
   {
-    std_msgs::Float64 err_angle;
-    std_msgs::Float64 setpoint;
+    std_msgs::Float64 err_angle, err_dist;
+    std_msgs::Float64 angle_setpoint, dist_setpoint;
     std_msgs::Int8 face2goal_msg;
     tf::TransformListener listener;
 
@@ -328,6 +374,11 @@ public:
     ros::Rate rate(n);
 
     while(n_.ok()){
+
+      if (!enable_move2goal){
+        rate.sleep();
+        continue;
+      }
 
       tf::StampedTransform transform;
       try{
@@ -344,22 +395,26 @@ public:
       }
 
       err_angle.data = get_angle(tf::Vector3(0.0, 0.0, 0.0), transform.getOrigin());
-      ROS_INFO("Angle %f",err_angle.data);
+      err_dist.data = get_dist(tf::Vector3(0.0, 0.0, 0.0), transform.getOrigin());
+      //ROS_INFO("Angle %f",err_angle.data);
+      //ROS_INFO("Distance %f",err_dist.data);
 
-      setpoint.data = 0.0;
-      pub_setpoint.publish(setpoint);
-      pub_state.publish(err_angle);
+      angle_setpoint.data = dist_setpoint.data = 0.0;
+      pub_angle_setpoint.publish(angle_setpoint);
+      pub_dist_setpoint.publish(dist_setpoint);
+      pub_angle_state.publish(err_angle);
+      pub_dist_state.publish(err_dist);
       //Delays untill it is time to send another message
       rate.sleep();
     }
   }
 private:
+  bool enable_move2goal;
   ros::NodeHandle n_;
-  ros::Publisher pub_setpoint;
-  ros::Publisher pub_state;
-  ros::Publisher pub_face2goal;
-  ros::Subscriber sub_;
-
+  ros::Publisher pub_angle_setpoint;
+  ros::Publisher pub_angle_state;
+  ros::Publisher pub_dist_setpoint;
+  ros::Publisher pub_dist_state;
 
   double get_angle(tf::Vector3 a, tf::Vector3 b)
   {
@@ -374,7 +429,16 @@ private:
 
       return angle;
   }
-};//End of class SubscribeAndPublish
+
+  double get_dist(tf::Vector3 a, tf::Vector3 b)
+  {
+      if ( a.getX() == b.getX() && a.getY() >= b.getY() ) return 0;
+
+      double dist = sqrt(b.getX()*b.getX()+b.getY()*b.getY());
+
+      return dist;
+  }
+};//End of class Move2Goal
 
 int main(int argc, char** argv) {
   // Announce this program to the ROS master as a "node" called "simple_move_node"
@@ -390,8 +454,9 @@ int main(int argc, char** argv) {
   obs_detect_avoidance_object.Obstacle_Detect_Enable(false);
   obs_detect_avoidance_object.Obstacle_Avoidance_Enable(false);
 
-  Face2Goal face_to_goal_object;
-  boost::thread thd_goal_listener(boost::bind(&Face2Goal::goal_listener, &face_to_goal_object, 10)); // param 10 : publish frequence
+  Move2Goal move_to_goal_object;
+  boost::thread thd_goal_listener(boost::bind(&Move2Goal::goal_listener, &move_to_goal_object, 10)); // param 10 : publish frequence
+  move_to_goal_object.move_2_goal_enable(true);
 
   // Process ROS callbacks until receiving a SIGINT (ctrl-c)
   ros::spin();
